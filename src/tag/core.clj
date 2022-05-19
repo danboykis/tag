@@ -1,9 +1,16 @@
 (ns tag.core
   (:require [clojure.string :as s]
-            [tag.shell :as sh]
             [clojure.java.io :as io]
             [clojure.data.xml :as dx]
-            [xml-in.core :as xml]))
+            [xml-in.core :as xml])
+  (:import [java.nio.file Files Paths]
+           [java.nio.file.attribute FileAttribute]
+           [java.time ZonedDateTime Instant ZoneId]
+           [java.io File]
+           [org.eclipse.jgit.api Git]
+           [org.eclipse.jgit.lib Constants ObjectId]
+           [org.eclipse.jgit.revwalk RevWalk RevTag RevCommit]
+           [java.time.format DateTimeFormatter]))
 
 (defn- fmv
   "apply f to each value v of map m"
@@ -12,24 +19,17 @@
         (for [[k v] m]
           [k (f v)])))
 
-(defn- dosh [cmd]
-  (let [with-args (s/split cmd #" ")
-        {:keys [out exit error] :as rs} (apply sh/sh with-args)]
-    (if-not (zero? exit)
-      (println (str "(!) could not run \"" cmd "\" => " rs ", but have no fear: I will continue without it."))
-      out)))
-
 (defn pom? [pom]
   (or (.exists (io/file pom))
       (println "(!) could not find" pom "maven pom file, will skip maven intel")))
 
 (defn- scoop-maven-intel [xpom]
   (when (pom? xpom)
-    (let [pom (-> (slurp xpom)
-                  (dx/parse-str :namespace-aware false))
+    (let [pom        (-> (slurp xpom)
+                         (dx/parse-str :namespace-aware false))
           in-project (xml/find-first pom [:project])
-          project (fn [k] (-> (xml/find-first in-project [k])
-                              first))]
+          project    (fn [k] (-> (xml/find-first in-project [k])
+                                 first))]
       {:group-id    (project :groupId)
        :artifact-id (project :artifactId)
        :version     (project :version)
@@ -37,17 +37,52 @@
        :description (project :description)
        :url         (project :url)})))
 
+(def dtf (DateTimeFormatter/ofPattern "EEE MMM dd HH:mm:s yyyy Z"))
+
+(defn short-commit-id [^ObjectId last-commit-id]
+  "git rev-parse --short HEAD"
+  (.name (.abbreviate last-commit-id 7)))
+
+(defn tag-name [^Git git ^RevWalk rev-walk ^RevCommit commit]
+  "git describe --abbrev=0"
+  (let [commit->tag (reduce (fn [acc tag] (assoc acc (.getObject tag) tag))
+                            {}
+                            (map #(.parseTag rev-walk (.getObjectId %)) (.call (.tagList git))))]
+    (when-let [t (get commit->tag commit)]
+      (.getTagName ^RevTag t))))
+
+(defn remote-origin-url [^Repository repo]
+  "git config --get remote.origin.url"
+  (.getString (.getConfig repo) "remote" "origin" "url"))
+
+(defn commit-time [^RevCommit commit]
+  "git log -1 --format=%cd"
+  (.format (ZonedDateTime/ofInstant (Instant/ofEpochSecond (.getCommitTime commit)) (ZoneId/systemDefault)) dtf) )
+
+(defn committer-name [^RevCommit commit]
+  "git log -1 --pretty=format:'%an'"
+  (.getName (.getCommitterIdent commit)))
+
+(defn commit-message [^RevCommit commit]
+  "git log -1 --pretty=%B"
+  (.getName (.getCommitterIdent commit)))
+
 (defn- scoop-git-intel []
-  (-> {:commit-id              (dosh "git rev-parse --short HEAD")
-       :version/tag            (dosh "git describe --abbrev=0")
-       :branch                 (dosh "git rev-parse --abbrev-ref HEAD")
-       :repo-url               (dosh "git config --get remote.origin.url")
-       :commit-time            (dosh "git log -1 --format=%cd")
-       "commit human (or not)" (dosh "git log -1 --pretty=format:'%an'")
-       :commit-message         (dosh "git log -1 --pretty=%B")}
-      (fmv #(some-> %
-                    (s/replace #"\n" " ")
-                    s/trim))))
+  (with-open [git      (Git/open (File. ".git"))
+              repo     (.getRepository git)
+              rev-walk (RevWalk. repo)]
+    (let [last-commit-id (.resolve repo Constants/HEAD)
+          commit         (.parseCommit rev-walk last-commit-id)]
+      (-> {:commit-id              (short-commit-id last-commit-id)
+           :version/tag            (tag-name git rev-walk commit)
+           :branch                 (.getBranch repo)        ;git rev-parse --abbrev-ref HEAD
+           :repo-url               (remote-origin-url repo)
+           :commit-time            (commit-time commit)
+           "commit human (or not)" (committer-name commit)
+           :commit-message         (commit-message commit)}
+          (fmv #(some-> %
+                        (s/replace #"\n" " ")
+                        s/trim))))))
 
 (defn describe
   ([app-name]
@@ -55,10 +90,10 @@
   ([app-name {:keys [about]}]
    (let [maven (scoop-maven-intel "pom.xml")
          intel {:about
-                {:app-name app-name
+                {:app-name       app-name
                  "what do I do?" about}
-                :git (scoop-git-intel)
-                :described-at (java.util.Date.)}]
+                :git          (scoop-git-intel)
+                :described-at (.format (ZonedDateTime/now) dtf)}]
      (if maven
        (assoc intel :maven maven)
        intel))))
@@ -67,11 +102,11 @@
   ([intel]
    (export-intel intel {}))
   ([intel {:keys [app-name path filename]
-           :or {filename "about.edn"
-                app-name "noname"
-                path "target/about/META-INF/"}}]
+           :or   {filename "about.edn"
+                  app-name "noname"
+                  path     "target/about/META-INF/"}}]
    (let [fpath (str path app-name "/")]
-     (dosh (str "mkdir -p " fpath))
+     (Files/createDirectories (Paths/get fpath) (into-array FileAttribute []))
      (spit (str fpath filename)
            intel)
      {:intel-exported-to (str fpath filename)})))
